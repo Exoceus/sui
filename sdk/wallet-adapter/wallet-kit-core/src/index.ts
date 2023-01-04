@@ -60,6 +60,7 @@ export function createWalletKitCore({
   adapters,
 }: WalletKitCoreOptions): WalletKitCore {
   const subscriptions: Set<(state: WalletKitCoreState) => void> = new Set();
+  let walletEventUnsubscribe: (() => void) | null = null;
 
   let internalState: InternalWalletKitCoreState = {
     accounts: [],
@@ -125,11 +126,22 @@ export function createWalletKitCore({
       const currentWallet =
         internalState.wallets.find((wallet) => wallet.name === walletName) ??
         null;
-
       // TODO: Should the current wallet actually be set before we successfully connect to it?
       setState({ currentWallet });
 
       if (currentWallet && !currentWallet.connecting) {
+        walletEventUnsubscribe = currentWallet.on(
+          "changed",
+          ({ connected }) => {
+            if (connected === false) {
+              setState({
+                status: WalletKitCoreConnectionStatus.DISCONNECTED,
+                accounts: [],
+                currentAccount: null,
+              });
+            }
+          }
+        );
         try {
           setState({ status: WalletKitCoreConnectionStatus.CONNECTING });
           await currentWallet.connect();
@@ -150,6 +162,10 @@ export function createWalletKitCore({
     },
 
     disconnect() {
+      if (walletEventUnsubscribe) {
+        walletEventUnsubscribe();
+        walletEventUnsubscribe = null;
+      }
       if (!internalState.currentWallet) {
         console.warn("Attempted to `disconnect` but no wallet was connected.");
         return;

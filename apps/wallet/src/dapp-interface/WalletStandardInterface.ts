@@ -12,6 +12,9 @@ import {
     type EventsFeature,
     type EventsOnMethod,
     type EventsListeners,
+    SUI_DEVNET_CHAIN,
+    SUI_TESTNET_CHAIN,
+    SUI_LOCALNET_CHAIN,
 } from '@mysten/wallet-standard';
 import mitt, { type Emitter } from 'mitt';
 import { filter, map, type Observable } from 'rxjs';
@@ -27,13 +30,18 @@ import {
     type HasPermissionsResponse,
     ALL_PERMISSION_TYPES,
 } from '_payloads/permissions';
+import { isWalletStatusChangePayload } from '_src/shared/messaging/messages/payloads/wallet-status-change';
+import { API_ENV } from '_src/ui/app/ApiProvider';
 
+import type { SuiAddress } from '@mysten/sui.js/src';
+import type { SuiChain, EventsChangeProperties } from '@mysten/wallet-standard';
 import type { GetAccount } from '_payloads/account/GetAccount';
 import type { GetAccountResponse } from '_payloads/account/GetAccountResponse';
 import type {
     ExecuteTransactionRequest,
     ExecuteTransactionResponse,
 } from '_payloads/transactions';
+import type { WalletStatusChange } from '_src/shared/messaging/messages/payloads/wallet-status-change';
 
 type WalletEventsMap = {
     [E in keyof EventsListeners]: Parameters<EventsListeners[E]>[0];
@@ -48,6 +56,7 @@ export class SuiWallet implements Wallet {
     readonly #name = name;
     #account: ReadonlyWalletAccount | null;
     #messagesStream: WindowMessageStream;
+    #activeChain: SuiChain | `http${'' | 's'}://${string}` | null = null;
 
     get version() {
         return this.#version;
@@ -64,6 +73,10 @@ export class SuiWallet implements Wallet {
     get chains() {
         // TODO: Extract chain from wallet:
         return SUI_CHAINS;
+    }
+
+    get activeChain() {
+        return this.#activeChain;
     }
 
     get features(): ConnectFeature &
@@ -89,6 +102,36 @@ export class SuiWallet implements Wallet {
         return this.#account ? [this.#account] : [];
     }
 
+    #setAccount(address: SuiAddress | null) {
+        if (!address) {
+            this.#account = null;
+            return;
+        }
+        this.#account = new ReadonlyWalletAccount({
+            address,
+            // TODO: Expose public key instead of address:
+            publicKey: new Uint8Array(),
+            chains: SUI_CHAINS,
+            features: ['sui:signAndExecuteTransaction'],
+        });
+    }
+
+    #setActiveChain(network: Required<WalletStatusChange>['network']) {
+        switch (network) {
+            case API_ENV.devNet:
+                this.#activeChain = SUI_DEVNET_CHAIN;
+                break;
+            case API_ENV.testNet:
+                this.#activeChain = SUI_TESTNET_CHAIN;
+                break;
+            case API_ENV.local:
+                this.#activeChain = SUI_LOCALNET_CHAIN;
+                break;
+            default:
+                this.#activeChain = network;
+        }
+    }
+
     constructor() {
         this.#events = mitt();
         this.#account = null;
@@ -96,11 +139,34 @@ export class SuiWallet implements Wallet {
             'sui_in-page',
             'sui_content-script'
         );
-
+        this.#messagesStream.messages.subscribe(({ payload }) => {
+            if (isWalletStatusChangePayload(payload)) {
+                const { network, accounts } = payload;
+                let change: EventsChangeProperties = {};
+                if (network) {
+                    this.#setActiveChain(network);
+                    // TODO add active network change to standard
+                    change = {
+                        ...change,
+                        ...{ activeChain: this.activeChain },
+                    };
+                }
+                if (accounts) {
+                    const [address = null] = accounts;
+                    if (address !== this.#account?.address) {
+                        this.#setAccount(address);
+                        change = { ...change, ...{ accounts: this.accounts } };
+                    }
+                }
+                console.log(network, accounts);
+                this.#events.emit('change', change);
+            }
+        });
         this.#connected();
     }
 
     #on: EventsOnMethod = (event, listener) => {
+        console.log('SuiWallet #on', event);
         this.#events.on(event, listener);
         return () => this.#events.off(event, listener);
     };
@@ -121,13 +187,7 @@ export class SuiWallet implements Wallet {
         if (address) {
             const account = this.#account;
             if (!account || account.address !== address) {
-                this.#account = new ReadonlyWalletAccount({
-                    address,
-                    // TODO: Expose public key instead of address:
-                    publicKey: new Uint8Array(),
-                    chains: SUI_CHAINS,
-                    features: ['sui:signAndExecuteTransaction'],
-                });
+                this.#setAccount(address);
                 this.#events.emit('change', { accounts: this.accounts });
             }
         }
