@@ -257,15 +257,20 @@ impl CoinReadApi {
         coin_type: Option<String>,
         amount: u128,
         locked_until_epoch: Option<EpochId>,
+        exclude: Vec<ObjectID>,
     ) -> SuiRpcResult<Vec<Coin>> {
         let mut total = 0u128;
         let coins = self
             .get_coins_stream(address, coin_type)
+            .filter(|coin: &Coin| {
+                future::ready(
+                    locked_until_epoch == coin.locked_until_epoch
+                        && !exclude.contains(&coin.coin_object_id),
+                )
+            })
             .take_while(|coin: &Coin| {
                 let ready = future::ready(total < amount);
-                if locked_until_epoch == coin.locked_until_epoch {
-                    total += coin.balance as u128;
-                }
+                total += coin.balance as u128;
                 ready
             })
             .collect::<Vec<_>>()
