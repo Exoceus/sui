@@ -48,6 +48,7 @@ import {
   GetObjectDataResponse,
   GetOwnedObjectsResponse,
 } from '../types';
+import { DynamicFieldPage } from '../types/dynamic_fields'
 import {
   PublicKey,
   SignatureScheme,
@@ -64,6 +65,7 @@ import { lt } from '@suchipi/femver';
 import { Base64DataBuffer } from '../serialization/base64';
 import { any, number } from 'superstruct';
 import { RawMoveCall } from '../signers/txn-data-serializers/txn-data-serializer';
+import { Option } from '../types/option';
 
 /**
  * Configuration options for the JsonRpcProvider. If the value of a field is not provided,
@@ -753,6 +755,38 @@ export class JsonRpcProvider extends Provider {
     } catch (err) {
       throw new Error(
         `Error dry running transaction with request type: ${err}`
+      );
+    }
+  }
+
+  async getDynamicFields(parent_object_id: ObjectId, cursor: Option<ObjectId>, limit: Option<number>): Promise<DynamicFieldPage> {
+    try {
+      const resp = await this.client.requestWithType(
+        'sui_getDynamicFields',
+        [parent_object_id, cursor, limit],
+        DynamicFieldPage,
+        this.options.skipDataValidation
+      );
+      return resp;
+    } catch (err) {
+      throw new Error(
+        `Error getting dynamic fields with request type: ${err}`
+      );
+    }
+  }
+
+  async getDynamicFieldObject(parent_object_id: ObjectId, name: String): Promise<GetObjectDataResponse> {
+    try {
+      const resp =  await this.client.requestWithType(
+        'sui_getDynamicFieldObject',
+        [parent_object_id, name],
+        GetObjectDataResponse,
+        this.options.skipDataValidation
+      );
+      return resp;
+    } catch (err) {
+      throw new Error(
+        `Error getting dynamic field object with request type: ${err}`
       );
     }
   }

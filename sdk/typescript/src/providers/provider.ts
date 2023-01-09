@@ -37,6 +37,9 @@ import {
   DevInspectResults,
 } from '../types';
 
+import { DynamicFieldPage } from '../types/dynamic_fields';
+import { Option } from '../types/option';
+
 ///////////////////////////////
 // Exported Abstracts
 export abstract class Provider {
@@ -271,5 +274,9 @@ export abstract class Provider {
    * @param txBytes
    */
   abstract dryRunTransaction(txBytes: string): Promise<TransactionEffects>;
+
+  abstract getDynamicFields(parent_object_id: ObjectId, cursor: Option<ObjectId>, limit: number): Promise<DynamicFieldPage>;
+
+  abstract getDynamicFieldObject(parent_object_id: ObjectId, name: string): Promise<GetObjectDataResponse>;
   // TODO: add more interface methods
 }
