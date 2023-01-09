@@ -20,18 +20,26 @@ module.exports = {
                 'alice-blue': '#F1F8FD',
             },
             spacing: {
-                7.5: '30px',
+                7.5: '1.875rem',
                 15: '60px',
             },
             minHeight: {
                 8: '2rem',
             },
+            boxShadow: {
+                'wallet-content': '0px -5px 20px 5px rgba(160, 182, 195, 0.15)',
+                button: '0px 1px 2px rgba(16, 24, 40, 0.05)',
+            },
+            borderRadius: {
+                20: '1.25rem',
+            },
             height: {
                 header: '68px',
-                7.5: '30px',
+                'popup-height': '595px',
+                'nav-height': '76px',
             },
             width: {
-                7.5: '30px',
+                'popup-width': '360px',
             },
         },
     },
