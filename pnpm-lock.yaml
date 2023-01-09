@@ -258,6 +258,7 @@ importers:
       react: ^18.2.0
       react-dom: ^18.2.0
       react-error-boundary: ^3.1.4
+      react-hot-toast: ^2.4.0
       react-intl: ^6.2.5
       react-number-format: ^4.9.3
       react-redux: ^8.0.5
@@ -318,6 +319,7 @@ importers:
       react: 18.2.0
       react-dom: 18.2.0_react@18.2.0
       react-error-boundary: 3.1.4_react@18.2.0
+      react-hot-toast: 2.4.0_biqbaboplfbrettd7655fr4n2y
       react-intl: 6.2.5_o77wnou4wwnegu5woljtklrzru
       react-number-format: 4.9.3_biqbaboplfbrettd7655fr4n2y
       react-redux: 8.0.5_ie75ejlwqy5zh3tldgt7pftwcu
@@ -4642,7 +4644,7 @@ packages:
       '@storybook/components': 7.0.0-beta.3_biqbaboplfbrettd7655fr4n2y
       '@storybook/csf-plugin': 7.0.0-beta.3
       '@storybook/csf-tools': 7.0.0-beta.3
-      '@storybook/mdx2-csf': 1.0.0-next.3
+      '@storybook/mdx2-csf': 1.0.0-next.4
       '@storybook/node-logger': 7.0.0-beta.3
       '@storybook/postinstall': 7.0.0-beta.3
       '@storybook/preview-api': 7.0.0-beta.3
@@ -5388,6 +5390,10 @@ packages:
 
   /@storybook/mdx2-csf/1.0.0-next.3:
     resolution: {integrity: sha512-obodj5cDa943eAPNmawzwviiaheWLvI39/o36O+fwkW8jxxXgyEMgad0mLTiwKjlvitLVoHa4Znm5aIN6TW08A==}
+    dev: true
+
+  /@storybook/mdx2-csf/1.0.0-next.4:
+    resolution: {integrity: sha512-nvRgYdpYvXsvSgCzKc4LQA1JxtJzmv47IsFAsh1rTz5FoHyK8watLU2WqX9T4w52fpFXBHx7RwGEsCRt0XgZlQ==}
     dev: true
 
   /@storybook/node-logger/7.0.0-beta.3:
