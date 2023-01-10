@@ -32,6 +32,7 @@ module.exports = {
             },
             borderRadius: {
                 20: '1.25rem',
+                15: '0.9375rem',
             },
             height: {
                 header: '68px',
@@ -39,6 +40,9 @@ module.exports = {
                 'nav-height': '76px',
             },
             width: {
+                'popup-width': '360px',
+            },
+            maxWidth: {
                 'popup-width': '360px',
             },
         },
