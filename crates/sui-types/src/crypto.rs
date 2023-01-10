@@ -221,27 +221,24 @@ impl EncodeDecodeBase64 for PublicKey {
 
     fn decode_base64(value: &str) -> Result<Self, eyre::Report> {
         let bytes = Base64::decode(value).map_err(|e| eyre!("{}", e.to_string()))?;
-        match bytes.first() {
-            Some(x) => {
-                if x == &<Ed25519PublicKey as SuiPublicKey>::SIGNATURE_SCHEME.flag() {
-                    let pk = Ed25519PublicKey::from_bytes(
+        match SignatureScheme::from_flag_byte(bytes.first().ok_or_else(|| eyre!("Invalid bytes"))?)
+        {
+            Ok(b) => match b {
+                SignatureScheme::ED25519 => Ok(PublicKey::Ed25519(Ed25519PublicKey::from_bytes(
+                    bytes.get(1..).ok_or_else(|| eyre!("Invalid length"))?,
+                )?)),
+                SignatureScheme::Secp256k1 => {
+                    Ok(PublicKey::Secp256k1(Secp256k1PublicKey::from_bytes(
                         bytes.get(1..).ok_or_else(|| eyre!("Invalid length"))?,
-                    )?;
-                    Ok(PublicKey::Ed25519(pk))
-                } else if x == &<Secp256k1PublicKey as SuiPublicKey>::SIGNATURE_SCHEME.flag() {
-                    let pk = Secp256k1PublicKey::from_bytes(
-                        bytes.get(1..).ok_or_else(|| eyre!("Invalid length"))?,
-                    )?;
-                    Ok(PublicKey::Secp256k1(pk))
-                } else if x == &<Secp256r1PublicKey as SuiPublicKey>::SIGNATURE_SCHEME.flag() {
-                    let pk = Secp256r1PublicKey::from_bytes(
-                        bytes.get(1..).ok_or_else(|| eyre!("Invalid length"))?,
-                    )?;
-                    Ok(PublicKey::Secp256r1(pk))
-                } else {
-                    Err(eyre!("Invalid flag byte"))
+                    )?))
                 }
-            }
+                SignatureScheme::Secp256r1 => {
+                    Ok(PublicKey::Secp256r1(Secp256r1PublicKey::from_bytes(
+                        bytes.get(1..).ok_or_else(|| eyre!("Invalid length"))?,
+                    )?))
+                }
+                _ => Err(eyre!("Invalid flag byte")),
+            },
             _ => Err(eyre!("Invalid bytes")),
         }
     }
@@ -252,8 +249,15 @@ impl Serialize for PublicKey {
     where
         S: Serializer,
     {
-        let s = self.encode_base64();
-        serializer.serialize_str(&s)
+        if serializer.is_human_readable() {
+            let s = self.encode_base64();
+            serializer.serialize_str(&s)
+        } else {
+            let mut bytes = Vec::new();
+            bytes.push(self.flag());
+            bytes.extend_from_slice(self.as_ref());
+            serializer.serialize_bytes(&bytes)
+        }
     }
 }
 
@@ -270,14 +274,6 @@ impl<'de> Deserialize<'de> for PublicKey {
 }
 
 impl PublicKey {
-    pub fn flag(&self) -> u8 {
-        match self {
-            PublicKey::Ed25519(_) => Ed25519SuiSignature::SCHEME.flag(),
-            PublicKey::Secp256k1(_) => Secp256k1SuiSignature::SCHEME.flag(),
-            PublicKey::Secp256r1(_) => Secp256r1SuiSignature::SCHEME.flag(),
-        }
-    }
-
     pub fn try_from_bytes(
         curve: SignatureScheme,
         key_bytes: &[u8],
@@ -301,6 +297,9 @@ impl PublicKey {
             PublicKey::Secp256k1(_) => Secp256k1SuiSignature::SCHEME,
             PublicKey::Secp256r1(_) => Secp256r1SuiSignature::SCHEME,
         }
+    }
+    pub fn flag(&self) -> u8 {
+        self.scheme().flag()
     }
 }
 
@@ -627,13 +626,11 @@ impl Serialize for Signature {
     where
         S: Serializer,
     {
-        let bytes = self.as_ref();
-
         if serializer.is_human_readable() {
-            let s = Base64::encode(bytes);
+            let s = self.encode_base64();
             serializer.serialize_str(&s)
         } else {
-            serializer.serialize_bytes(bytes)
+            serializer.serialize_bytes(self.as_ref())
         }
     }
 }
@@ -644,16 +641,9 @@ impl<'de> Deserialize<'de> for Signature {
         D: Deserializer<'de>,
     {
         use serde::de::Error;
-
-        let bytes = if deserializer.is_human_readable() {
-            let s = String::deserialize(deserializer)?;
-            Base64::decode(&s).map_err(|e| Error::custom(e.to_string()))?
-        } else {
-            let data: Vec<u8> = Vec::deserialize(deserializer)?;
-            data
-        };
-
-        Self::from_bytes(&bytes).map_err(|e| Error::custom(e.to_string()))
+        let s = String::deserialize(deserializer)?;
+        <Signature as EncodeDecodeBase64>::decode_base64(&s)
+            .map_err(|e| Error::custom(e.to_string()))
     }
 }
 
@@ -700,24 +690,25 @@ impl AsMut<[u8]> for Signature {
 
 impl signature::Signature for Signature {
     fn from_bytes(bytes: &[u8]) -> Result<Self, signature::Error> {
-        match bytes.first() {
-            Some(x) => {
-                if x == &Ed25519SuiSignature::SCHEME.flag() {
+        match SignatureScheme::from_flag_byte(bytes.first().ok_or_else(signature::Error::new)?) {
+            Ok(b) => match b {
+                SignatureScheme::ED25519 => {
                     Ok(<Ed25519SuiSignature as ToFromBytes>::from_bytes(bytes)
                         .map_err(|_| signature::Error::new())?
                         .into())
-                } else if x == &Secp256k1SuiSignature::SCHEME.flag() {
+                }
+                SignatureScheme::Secp256k1 => {
                     Ok(<Secp256k1SuiSignature as ToFromBytes>::from_bytes(bytes)
                         .map_err(|_| signature::Error::new())?
                         .into())
-                } else if x == &Secp256r1SuiSignature::SCHEME.flag() {
+                }
+                SignatureScheme::Secp256r1 => {
                     Ok(<Secp256r1SuiSignature as ToFromBytes>::from_bytes(bytes)
                         .map_err(|_| signature::Error::new())?
                         .into())
-                } else {
-                    Err(signature::Error::new())
                 }
-            }
+                _ => Err(signature::Error::new()),
+            },
             _ => Err(signature::Error::new()),
         }
     }
