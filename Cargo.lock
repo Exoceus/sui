@@ -8382,6 +8382,7 @@ dependencies = [
  "futures",
  "hdrhistogram",
  "indicatif",
+ "itertools",
  "move-core-types",
  "multiaddr",
  "narwhal-node",

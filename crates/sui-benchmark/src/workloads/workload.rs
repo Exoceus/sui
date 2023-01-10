@@ -5,61 +5,21 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use std::{collections::HashMap, fmt};
 
-use sui_types::{
-    base_types::{ObjectID, ObjectRef},
-    object::Owner,
-};
+use sui_types::base_types::{ObjectID, ObjectRef};
 
-use sui_core::test_utils::make_transfer_sui_transaction;
-use sui_types::{base_types::SuiAddress, crypto::AccountKeyPair, messages::VerifiedTransaction};
+use sui_types::messages::VerifiedTransaction;
 
+use crate::util::Gas;
 use rand::{prelude::*, rngs::OsRng};
 use rand_distr::WeightedAliasIndex;
+use sui_types::base_types::SuiAddress;
+use sui_types::crypto::AccountKeyPair;
 
 use crate::ValidatorProxy;
 
 // This is the maximum gas we will transfer from primary coin into any gas coin
 // for running the benchmark
 pub const MAX_GAS_FOR_TESTING: u64 = 1_000_000_000;
-
-pub type Gas = (ObjectRef, Owner);
-
-pub type UpdatedAndNewlyMinted = (ObjectRef, ObjectRef);
-
-pub async fn transfer_sui_for_testing(
-    gas: Gas,
-    keypair: &AccountKeyPair,
-    value: u64,
-    address: SuiAddress,
-    proxy: Arc<dyn ValidatorProxy + Sync + Send>,
-) -> UpdatedAndNewlyMinted {
-    let tx = make_transfer_sui_transaction(
-        gas.0,
-        address,
-        Some(value),
-        gas.1.get_owner_address().unwrap(),
-        keypair,
-    );
-    let tx_digest = *tx.digest();
-    // Intensive retry is done by proxy
-    let (_, effects) = proxy
-        .execute_transaction(tx.clone().into())
-        .await
-        .unwrap_or_else(|e| {
-            panic!(
-                "Failed to finish transfer_sui_for_testing {:?}, err: {:?}",
-                tx_digest, e
-            )
-        });
-    let minted = effects.created().get(0).unwrap().0;
-    let updated = effects
-        .mutated()
-        .iter()
-        .find(|(k, _)| k.0 == gas.0 .0)
-        .unwrap()
-        .0;
-    (updated, minted)
-}
 
 pub trait Payload: Send + Sync {
     fn make_new_payload(
@@ -123,6 +83,7 @@ impl Payload for CombinationPayload {
 pub enum WorkloadType {
     SharedCounter,
     TransferObject,
+    Combination,
 }
 
 impl fmt::Display for WorkloadType {
@@ -130,22 +91,57 @@ impl fmt::Display for WorkloadType {
         match self {
             WorkloadType::SharedCounter => write!(f, "shared_counter"),
             WorkloadType::TransferObject => write!(f, "transfer_object"),
+            WorkloadType::Combination => write!(f, "combination"),
         }
     }
+}
+
+#[derive(Clone)]
+pub struct GasCoinConfig {
+    // amount of SUI to transfer to this gas coin
+    pub amount: u64,
+    // recipient of this gas coin
+    pub address: SuiAddress,
+    // recipient account key pair (useful for signing txns)
+    pub keypair: Arc<AccountKeyPair>,
+}
+
+#[derive(Clone)]
+pub struct WorkloadInitConfig {
+    // Gas coins to initialize shared counter workload
+    // This includes the coins to publish the package and create
+    // shared counters
+    pub shared_counter_init_gas: Vec<Gas>,
+}
+
+#[derive(Clone)]
+pub struct WorkloadPayloadConfig {
+    // Gas coins to be used as transfer tokens
+    // These are the objects which get transferred
+    // between different accounts during the course of benchmark
+    pub transfer_tokens: Vec<Gas>,
+    // Gas coins needed to run transfer transactions during
+    // the course of benchmark
+    pub transfer_object_payload_gas: Vec<Gas>,
+    // Gas coins needed to run shared counter increment during
+    // the course of benchmark
+    pub shared_counter_payload_gas: Vec<Gas>,
 }
 
 #[async_trait]
 pub trait Workload<T: Payload + ?Sized>: Send + Sync {
     async fn init(
         &mut self,
-        num_shared_counters: u64,
+        init_config: WorkloadInitConfig,
         proxy: Arc<dyn ValidatorProxy + Sync + Send>,
     );
     async fn make_test_payloads(
         &self,
-        count: u64,
+        num_payloads: u64,
+        payload_config: WorkloadPayloadConfig,
         proxy: Arc<dyn ValidatorProxy + Sync + Send>,
     ) -> Vec<Box<T>>;
+    fn get_workload_type(&self) -> WorkloadType;
 }
 
 type WeightAndPayload = (u32, Box<dyn Workload<dyn Payload>>);
@@ -157,29 +153,31 @@ pub struct CombinationWorkload {
 impl Workload<dyn Payload> for CombinationWorkload {
     async fn init(
         &mut self,
-        num_shared_counters: u64,
+        init_config: WorkloadInitConfig,
         proxy: Arc<dyn ValidatorProxy + Sync + Send>,
     ) {
         for (_, (_, workload)) in self.workloads.iter_mut() {
-            workload.init(num_shared_counters, proxy.clone()).await;
+            workload.init(init_config.clone(), proxy.clone()).await;
         }
     }
     async fn make_test_payloads(
         &self,
-        count: u64,
+        num_payloads: u64,
+        payload_config: WorkloadPayloadConfig,
         proxy: Arc<dyn ValidatorProxy + Sync + Send>,
     ) -> Vec<Box<dyn Payload>> {
         let mut workloads: HashMap<WorkloadType, (u32, Vec<Box<dyn Payload>>)> = HashMap::new();
         for (workload_type, (weight, workload)) in self.workloads.iter() {
-            let payloads: Vec<Box<dyn Payload>> =
-                workload.make_test_payloads(count, proxy.clone()).await;
-            assert_eq!(payloads.len() as u64, count);
+            let payloads: Vec<Box<dyn Payload>> = workload
+                .make_test_payloads(num_payloads, payload_config.clone(), proxy.clone())
+                .await;
+            assert_eq!(payloads.len() as u64, num_payloads);
             workloads
                 .entry(*workload_type)
                 .or_insert_with(|| (*weight, payloads));
         }
         let mut res = vec![];
-        for _i in 0..count {
+        for _i in 0..num_payloads {
             let mut all_payloads: Vec<Box<dyn Payload>> = vec![];
             let mut dist = vec![];
             for (_type, (weight, payloads)) in workloads.iter_mut() {
@@ -197,6 +195,9 @@ impl Workload<dyn Payload> for CombinationWorkload {
             .map(|b| Box::<dyn Payload>::from(b))
             .collect()
     }
+    fn get_workload_type(&self) -> WorkloadType {
+        WorkloadType::Combination
+    }
 }
 
 impl CombinationWorkload {
@@ -212,4 +213,5 @@ pub struct WorkloadInfo {
     pub num_workers: u64,
     pub max_in_flight_ops: u64,
     pub workload: Box<dyn Workload<dyn Payload>>,
+    pub payload_config: WorkloadPayloadConfig,
 }

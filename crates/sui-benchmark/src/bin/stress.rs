@@ -13,7 +13,10 @@ use sui_benchmark::drivers::driver::Driver;
 use sui_benchmark::drivers::BenchmarkCmp;
 use sui_benchmark::drivers::BenchmarkStats;
 use sui_benchmark::drivers::Interval;
-use sui_benchmark::util::get_ed25519_keypair_from_keystore;
+use sui_benchmark::util::{
+    generate_gas_for_test, get_ed25519_keypair_from_keystore, split_coin_and_pay,
+    MAX_GAS_FOR_TESTING,
+};
 use sui_benchmark::workloads::{
     make_combination_workload, make_shared_counter_workload, make_transfer_object_workload,
 };
@@ -24,10 +27,13 @@ use sui_config::utils;
 use sui_node::metrics;
 use sui_types::base_types::ObjectID;
 use sui_types::base_types::SuiAddress;
-use sui_types::crypto::{deterministic_random_account_key, AccountKeyPair};
+use sui_types::crypto::{deterministic_random_account_key, get_key_pair, AccountKeyPair};
 use tokio::time::sleep;
 
-use sui_types::object::generate_test_gas_objects_with_owner;
+use sui_benchmark::workloads::shared_counter::SharedCounterWorkload;
+use sui_benchmark::workloads::transfer_object::TransferObjectWorkload;
+use sui_benchmark::workloads::workload::{WorkloadInitConfig, WorkloadPayloadConfig};
+use sui_types::object::{generate_test_gas_objects_with_owner, Owner};
 use test_utils::authority::test_and_configure_authority_configs;
 use test_utils::authority::{spawn_fullnode, spawn_test_authorities};
 use tokio::runtime::Builder;
@@ -210,7 +216,7 @@ async fn main() -> Result<()> {
 
     let barrier = Arc::new(Barrier::new(2));
     let cloned_barrier = barrier.clone();
-    let (primary_gas_id, owner, keypair, aggregator) = if opts.local {
+    let (primary_gas, pay_coin, aggregator) = if opts.local {
         info!("Configuring local benchmark..");
         let configs = {
             let mut configs = test_and_configure_authority_configs(opts.committee_size as usize);
@@ -226,11 +232,12 @@ async fn main() -> Result<()> {
 
         // bring up servers ..
         let (owner, keypair): (SuiAddress, AccountKeyPair) = deterministic_random_account_key();
-        let primary_gas = generate_test_gas_objects_with_owner(1, owner);
-        let primary_gas_id = primary_gas.get(0).unwrap().id();
+        let generated_gas = generate_test_gas_objects_with_owner(2, owner);
+        let primary_gas = generated_gas.get(0).unwrap().clone();
+        let pay_coin = generated_gas.get(1).unwrap().clone();
         // Make the client runtime wait until we are done creating genesis objects
         let cloned_config = configs.clone();
-        let cloned_gas = primary_gas;
+        let cloned_gas = generated_gas;
         let fullnode_ip = format!("{}", utils::get_local_ip_for_tests());
         let fullnode_rpc_port = utils::get_available_port(&fullnode_ip);
 
@@ -270,7 +277,15 @@ async fn main() -> Result<()> {
             )
             .await,
         );
-        (primary_gas_id, owner, Arc::new(keypair), proxy)
+        (
+            (
+                primary_gas.compute_object_reference(),
+                Owner::AddressOwner(owner),
+                Arc::new(keypair),
+            ),
+            pay_coin.clone(),
+            proxy,
+        )
     } else {
         info!("Configuring remote benchmark..");
         std::thread::spawn(move || {
@@ -306,7 +321,8 @@ async fn main() -> Result<()> {
         let ids = ObjectID::in_range(offset, opts.primary_gas_objects)?;
         let primary_gas_id = ids.choose(&mut rand::thread_rng()).unwrap();
         let primary_gas = proxy.get_object(*primary_gas_id).await?;
-
+        let pay_coin_id = ids.choose(&mut rand::thread_rng()).unwrap();
+        let pay_coin = proxy.get_object(*pay_coin_id).await?;
         let primary_gas_account = primary_gas.owner.get_owner_address()?;
         let keystore_path = Some(&opts.keystore_path)
             .filter(|s| !s.is_empty())
@@ -320,9 +336,12 @@ async fn main() -> Result<()> {
         let ed25519_keypair =
             get_ed25519_keypair_from_keystore(keystore_path, &primary_gas_account)?;
         (
-            *primary_gas_id,
-            primary_gas_account,
-            Arc::new(ed25519_keypair),
+            (
+                primary_gas.compute_object_reference(),
+                Owner::AddressOwner(primary_gas_account),
+                Arc::new(ed25519_keypair),
+            ),
+            pay_coin,
             proxy,
         )
     };
@@ -353,23 +372,49 @@ async fn main() -> Result<()> {
                 } => {
                     let shared_counter_ratio = 1.0
                         - (std::cmp::min(shared_counter_hotness_factor as u32, 100) as f32 / 100.0);
+                    let max_ops = target_qps * in_flight_ratio;
+                    let num_shared_counters = (max_ops as f32 * shared_counter_ratio) as u64;
+                    let num_transfer_object_tokens = max_ops;
                     let workloads = if !opts.disjoint_mode {
+                        let all_shared_counter_coin_configs = if shared_counter <= 0 {
+                            None
+                        } else {
+                            let shared_counter_init_coin_configs =
+                                SharedCounterWorkload::generate_coin_config_for_init(num_shared_counters);
+                            let shared_counter_payload_coin_configs =
+                                SharedCounterWorkload::generate_coin_config_for_payloads(max_ops);
+                            Some((shared_counter_init_coin_configs, shared_counter_payload_coin_configs))
+                        };
+                        let all_transfer_object_coin_configs = if transfer_object <= 0 {
+                            None
+                        } else {
+                            let transfer_object_payload_coin_configs =
+                                TransferObjectWorkload::generate_coin_config_for_payloads(in_flight_ratio * target_qps, opts.num_transfer_accounts, in_flight_ratio * target_qps);
+                            Some(transfer_object_payload_coin_configs)
+                        };
+                        let (shared_counter_init_coin_configs, shared_counter_payload_coin_configs) = all_shared_counter_coin_configs.unwrap_or((vec![], vec![]));
+                        let transfer_object_payload_coin_configs = all_transfer_object_coin_configs.unwrap_or(vec![]);
+                        let (workload_init_config, workload_payload_config) = generate_gas_for_test(
+                            arc_agg.clone(),
+                            &pay_coin,
+                            primary_gas,
+                            num_transfer_object_tokens,
+                            shared_counter_init_coin_configs,
+                            shared_counter_payload_coin_configs,
+                            transfer_object_payload_coin_configs
+                        ).await?;
                         let mut combination_workload = make_combination_workload(
                             target_qps,
                             num_workers,
                             in_flight_ratio,
-                            primary_gas_id,
-                            owner,
-                            keypair,
                             opts.num_transfer_accounts,
                             shared_counter,
                             transfer_object,
+                            workload_payload_config,
                         );
-                        let max_ops = target_qps * in_flight_ratio;
-                        let num_shared_counters = (max_ops as f32 * shared_counter_ratio) as u64;
                         combination_workload
                             .workload
-                            .init(num_shared_counters, arc_agg.clone())
+                            .init(workload_init_config, arc_agg.clone())
                             .await;
                         vec![combination_workload]
                     } else {
@@ -382,43 +427,77 @@ async fn main() -> Result<()> {
                         let shared_counter_max_ops = (shared_counter_qps * in_flight_ratio) as u64;
                         let num_shared_counters =
                             (shared_counter_max_ops as f32 * shared_counter_ratio) as u64;
-                        if let Some(mut shared_counter_workload) = make_shared_counter_workload(
-                            shared_counter_qps,
-                            shared_counter_num_workers,
-                            shared_counter_max_ops,
-                            primary_gas_id,
-                            owner,
-                            keypair.clone(),
-                        ) {
-                            shared_counter_workload
-                                .workload
-                                .init(num_shared_counters, arc_agg.clone())
-                                .await;
-                            workloads.push(shared_counter_workload);
-                        }
+                        let all_shared_counter_coin_configs = if shared_counter_qps == 0 || shared_counter_max_ops == 0 || shared_counter_num_workers == 0 {
+                            None
+                        } else {
+                            let shared_counter_init_coin_configs =
+                                SharedCounterWorkload::generate_coin_config_for_init(num_shared_counters);
+                            let shared_counter_payload_coin_configs =
+                                SharedCounterWorkload::generate_coin_config_for_payloads(shared_counter_max_ops);
+                            Some((shared_counter_init_coin_configs, shared_counter_payload_coin_configs))
+                        };
                         let transfer_object_weight = 1.0 - shared_counter_weight;
                         let transfer_object_qps = target_qps - shared_counter_qps;
                         let transfer_object_num_workers =
                             (transfer_object_weight * num_workers as f32).ceil() as u64;
-                        let transfer_object_max_ops =
-                            (transfer_object_qps * in_flight_ratio) as u64;
+                        let transfer_object_max_ops = (transfer_object_qps * in_flight_ratio) as u64;
+                        let all_transfer_object_coin_configs = if transfer_object_qps == 0 || transfer_object_max_ops == 0 || transfer_object_num_workers == 0 {
+                            None
+                        } else {
+                            let transfer_object_payload_coin_configs =
+                                TransferObjectWorkload::generate_coin_config_for_payloads(transfer_object_max_ops, opts.num_transfer_accounts, transfer_object_max_ops);
+                            Some(transfer_object_payload_coin_configs)
+                        };
+
+                        let (shared_counter_init_coin_configs, shared_counter_payload_coin_configs) = all_shared_counter_coin_configs.unwrap_or((vec![], vec![]));
+                        let transfer_object_payload_coin_configs = all_transfer_object_coin_configs.unwrap_or(vec![]);
+                        let (workload_init_config, workload_payload_config) = generate_gas_for_test(
+                            arc_agg.clone(),
+                            &pay_coin,
+                            primary_gas,
+                            num_transfer_object_tokens,
+                            shared_counter_init_coin_configs,
+                            shared_counter_payload_coin_configs,
+                            transfer_object_payload_coin_configs
+                        ).await?;
+                        if let Some(mut shared_counter_workload) = make_shared_counter_workload(
+                            shared_counter_qps,
+                            shared_counter_num_workers,
+                            shared_counter_max_ops,
+                            WorkloadPayloadConfig {
+                                transfer_tokens: vec![],
+                                transfer_object_payload_gas: vec![],
+                                shared_counter_payload_gas: workload_payload_config.shared_counter_payload_gas,
+                            }
+                        ) {
+                            shared_counter_workload
+                                .workload
+                                .init(workload_init_config, arc_agg.clone())
+                                .await;
+                            workloads.push(shared_counter_workload);
+                        }
                         if let Some(mut transfer_object_workload) = make_transfer_object_workload(
                             transfer_object_qps,
                             transfer_object_num_workers,
                             transfer_object_max_ops,
                             opts.num_transfer_accounts,
-                            &primary_gas_id,
-                            owner,
-                            keypair,
+                            WorkloadPayloadConfig {
+                                transfer_tokens: workload_payload_config.transfer_tokens,
+                                transfer_object_payload_gas: workload_payload_config.transfer_object_payload_gas,
+                                shared_counter_payload_gas: vec![],
+                            }
                         ) {
                             transfer_object_workload
                                 .workload
-                                .init(num_shared_counters, arc_agg.clone())
+                                .init(WorkloadInitConfig {
+                                    shared_counter_init_gas: vec![],
+                                }, arc_agg.clone())
                                 .await;
                             workloads.push(transfer_object_workload);
                         }
                         workloads
                     };
+
                     let interval = opts.run_duration;
                     // We only show continuous progress in stderr
                     // if benchmark is running in unbounded mode,

@@ -1,10 +1,10 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{collections::HashMap, sync::Arc};
-
 use async_trait::async_trait;
-use rand::seq::IteratorRandom;
+use itertools::Itertools;
+use std::collections::HashMap;
+use std::sync::Arc;
 use tracing::info;
 
 use sui_types::{
@@ -14,12 +14,12 @@ use sui_types::{
     object::Owner,
 };
 
+use crate::util::Gas;
+use crate::workloads::workload::{GasCoinConfig, WorkloadInitConfig, WorkloadPayloadConfig};
 use crate::ValidatorProxy;
 use sui_core::test_utils::make_transfer_object_transaction;
 
-use super::workload::{
-    transfer_sui_for_testing, Gas, Payload, Workload, WorkloadType, MAX_GAS_FOR_TESTING,
-};
+use super::workload::{Payload, Workload, WorkloadType, MAX_GAS_FOR_TESTING};
 
 pub struct TransferObjectTestPayload {
     transfer_object: ObjectRef,
@@ -35,22 +35,24 @@ impl Payload for TransferObjectTestPayload {
         new_object: ObjectRef,
         new_gas: ObjectRef,
     ) -> Box<dyn Payload> {
-        let updated_gas: Vec<Gas> = self
-            .gas
-            .iter()
-            .map(|x| {
-                if x.1.get_owner_address().unwrap() == self.transfer_from {
-                    (new_gas, Owner::AddressOwner(self.transfer_from))
-                } else {
-                    *x
-                }
-            })
-            .collect();
-        let (_, recipient) = self
+        let recipient = self
             .gas
             .iter()
             .find(|x| x.1.get_owner_address().unwrap() != self.transfer_to)
-            .unwrap();
+            .unwrap()
+            .1
+            .clone();
+        let updated_gas: Vec<Gas> = self
+            .gas
+            .into_iter()
+            .map(|x| {
+                if x.1.get_owner_address().unwrap() == self.transfer_from {
+                    (new_gas, Owner::AddressOwner(self.transfer_from), x.2)
+                } else {
+                    x
+                }
+            })
+            .collect();
         Box::new(TransferObjectTestPayload {
             transfer_object: new_object,
             transfer_from: self.transfer_to,
@@ -60,7 +62,7 @@ impl Payload for TransferObjectTestPayload {
         })
     }
     fn make_transaction(&self) -> VerifiedTransaction {
-        let (gas_obj, _) = self
+        let (gas_obj, _, _) = self
             .gas
             .iter()
             .find(|x| x.1.get_owner_address().unwrap() == self.transfer_from)
@@ -82,30 +84,49 @@ impl Payload for TransferObjectTestPayload {
 }
 
 pub struct TransferObjectWorkload {
-    pub test_gas: ObjectID,
-    pub test_gas_owner: SuiAddress,
-    pub test_gas_keypair: Arc<AccountKeyPair>,
-    pub num_accounts: u64,
     pub transfer_keypairs: Arc<HashMap<SuiAddress, AccountKeyPair>>,
 }
 
 impl TransferObjectWorkload {
-    pub fn new_boxed(
-        num_accounts: u64,
-        gas: ObjectID,
-        owner: SuiAddress,
-        keypair: Arc<AccountKeyPair>,
-    ) -> Box<dyn Workload<dyn Payload>> {
+    pub fn new_boxed(num_accounts: u64) -> Box<dyn Workload<dyn Payload>> {
         // create several accounts to transfer object between
         let keypairs: Arc<HashMap<SuiAddress, AccountKeyPair>> =
             Arc::new((0..num_accounts).map(|_| get_key_pair()).collect());
         Box::new(TransferObjectWorkload {
-            test_gas: gas,
-            test_gas_owner: owner,
-            test_gas_keypair: keypair,
-            num_accounts,
             transfer_keypairs: keypairs,
         })
+    }
+    pub fn generate_coin_config_for_payloads(
+        num_tokens: u64,
+        num_transfer_accounts: u64,
+        num_payloads: u64,
+    ) -> Vec<GasCoinConfig> {
+        let mut configs = vec![];
+
+        // transfer tokens
+        for _i in 0..num_tokens {
+            let (address, keypair) = get_key_pair();
+            configs.push(GasCoinConfig {
+                amount: MAX_GAS_FOR_TESTING,
+                address,
+                keypair: Arc::new(keypair),
+            });
+        }
+
+        // num_transfer_accounts
+        for _i in 0..num_transfer_accounts {
+            let (address, keypair) = get_key_pair();
+            let cloned_keypair: Arc<AccountKeyPair> = Arc::new(keypair);
+            for _j in 0..num_payloads {
+                configs.push(GasCoinConfig {
+                    amount: MAX_GAS_FOR_TESTING,
+                    address,
+                    keypair: cloned_keypair.clone(),
+                });
+            }
+        }
+
+        configs
     }
 }
 
@@ -113,73 +134,47 @@ impl TransferObjectWorkload {
 impl Workload<dyn Payload> for TransferObjectWorkload {
     async fn init(
         &mut self,
-        _num_shared_counters: u64,
+        _init_config: WorkloadInitConfig,
         _proxy: Arc<dyn ValidatorProxy + Sync + Send>,
     ) {
         return;
     }
     async fn make_test_payloads(
         &self,
-        count: u64,
-        proxy: Arc<dyn ValidatorProxy + Sync + Send>,
+        num_payloads: u64,
+        payload_config: WorkloadPayloadConfig,
+        _proxy: Arc<dyn ValidatorProxy + Sync + Send>,
     ) -> Vec<Box<dyn Payload>> {
-        // Read latest test gas object
-        let primary_gas = proxy.get_object(self.test_gas).await.unwrap();
-        let mut primary_gas_ref = primary_gas.compute_object_reference();
-        let owner = *self
-            .transfer_keypairs
-            .keys()
-            .choose(&mut rand::thread_rng())
-            .unwrap();
+        let gas_by_address: HashMap<SuiAddress, Vec<Gas>> = payload_config
+            .transfer_object_payload_gas
+            .into_iter()
+            .group_by(|x| (*x).1.get_owner_address().expect("Failed to get address"))
+            .into_iter()
+            .map(|(address, group)| (address, group.collect()))
+            .collect::<HashMap<SuiAddress, Vec<Gas>>>();
+
         // create as many gas objects as there are number of transfer objects times number of accounts
         info!("Creating enough gas to transfer objects..");
         let mut transfer_gas: Vec<Vec<Gas>> = vec![];
-        for _i in 0..count {
+        for i in 0..num_payloads {
             let mut account_transfer_gas = vec![];
-            for (owner, _) in self.transfer_keypairs.iter() {
-                let (updated, minted) = transfer_sui_for_testing(
-                    (primary_gas_ref, Owner::AddressOwner(self.test_gas_owner)),
-                    &self.test_gas_keypair,
-                    MAX_GAS_FOR_TESTING,
-                    *owner,
-                    proxy.clone(),
-                )
-                .await;
-                primary_gas_ref = updated;
-                account_transfer_gas.push((minted, Owner::AddressOwner(*owner)));
+            for (address, _) in self.transfer_keypairs.iter() {
+                account_transfer_gas.push(gas_by_address[address][i as usize].clone());
             }
             transfer_gas.push(account_transfer_gas);
         }
-        info!("Creating transfer object txns, almost done..");
-        // create transfer objects with 1 SUI value each
-        let mut transfer_objects: Vec<Gas> = vec![];
-        for _i in 0..count {
-            let (updated, minted) = transfer_sui_for_testing(
-                (primary_gas_ref, Owner::AddressOwner(self.test_gas_owner)),
-                &self.test_gas_keypair,
-                1,
-                owner,
-                proxy.clone(),
-            )
-            .await;
-            primary_gas_ref = updated;
-            transfer_objects.push((minted, Owner::AddressOwner(owner)));
-        }
-        let refs: Vec<(Vec<Gas>, ObjectRef)> = transfer_gas
+        let refs: Vec<(Vec<Gas>, Gas)> = transfer_gas
             .into_iter()
-            .zip(transfer_objects.iter())
-            .map(|(g, t)| (g, t.0))
+            .zip(payload_config.transfer_tokens.into_iter())
+            .map(|(g, t)| (g, t.clone()))
             .collect();
-        refs.iter()
+        refs.into_iter()
             .map(|(g, t)| {
-                let from = owner;
-                let (_, to) = *g
-                    .iter()
-                    .find(|x| x.1.get_owner_address().unwrap() != from)
-                    .unwrap();
+                let from = t.1;
+                let to = g.iter().find(|x| x.1 != from).unwrap().1;
                 Box::new(TransferObjectTestPayload {
-                    transfer_object: *t,
-                    transfer_from: from,
+                    transfer_object: t.0,
+                    transfer_from: from.get_owner_address().unwrap(),
                     transfer_to: to.get_owner_address().unwrap(),
                     gas: g.clone(),
                     keypairs: self.transfer_keypairs.clone(),
@@ -187,5 +182,8 @@ impl Workload<dyn Payload> for TransferObjectWorkload {
             })
             .map(|b| Box::<dyn Payload>::from(b))
             .collect()
+    }
+    fn get_workload_type(&self) -> WorkloadType {
+        WorkloadType::TransferObject
     }
 }
