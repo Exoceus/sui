@@ -644,13 +644,7 @@ impl SuiNode {
         loop {
             let Committee {
                 epoch: next_epoch, ..
-            } = self
-                .reconfig_channel
-                .lock()
-                .await
-                .recv()
-                .await
-                .expect("Reconfiguration channel was closed unexpectedly.");
+            } = self.checkpoint_executor.run().await;
             info!(
                 ?next_epoch,
                 "Received reconfiguration signal. About to reconfigure the system."
