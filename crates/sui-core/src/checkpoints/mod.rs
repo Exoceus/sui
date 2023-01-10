@@ -481,6 +481,11 @@ impl CheckpointBuilder {
         );
         for (index, mut effects) in chunks.into_iter().enumerate() {
             let last_checkpoint_of_epoch = last_pending_of_epoch && index == chunks_count - 1;
+            let digests_without_epoch_augment: Vec<_> =
+                effects.iter().map(|e| e.transaction_digest).collect();
+            let signatures = self
+                .epoch_store
+                .user_signatures_for_checkpoint(&digests_without_epoch_augment)?;
             let epoch_rolling_gas_cost_summary =
                 self.get_epoch_total_gas_cost(last_checkpoint.as_ref().map(|(_, c)| c), &effects);
             if last_checkpoint_of_epoch {
@@ -488,9 +493,11 @@ impl CheckpointBuilder {
                     .await?;
             }
 
-            let contents = CheckpointContents::new_with_causally_ordered_transactions(
-                effects.iter().map(TransactionEffects::execution_digests),
-            );
+            let contents =
+                CheckpointContents::new_with_causally_ordered_transactions_and_signatures(
+                    effects.iter().map(TransactionEffects::execution_digests),
+                    signatures,
+                );
 
             let num_txns = contents.size() as u64;
 
