@@ -39,10 +39,10 @@ module.exports = {
                 'popup-height': '595px',
                 'nav-height': '76px',
             },
-            width: {
+            maxWidth: {
                 'popup-width': '360px',
             },
-            maxWidth: {
+            width: {
                 'popup-width': '360px',
             },
         },
