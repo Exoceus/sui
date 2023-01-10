@@ -59,7 +59,7 @@ pub async fn payloads(
     let data = request
         .operations
         .into_internal(Some(metadata.tx_metadata.clone().into()))?
-        .try_into_data(metadata);
+        .try_into_data(metadata)?;
     let intent_msg = IntentMessage::new(Intent::default(), data);
     let intent_msg_bytes = bcs::to_bytes(&intent_msg)?;
 
