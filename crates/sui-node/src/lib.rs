@@ -75,6 +75,7 @@ use sui_core::narwhal_manager::{
     run_narwhal_manager, NarwhalConfiguration, NarwhalManager, NarwhalStartMessage,
 };
 use sui_json_rpc::coin_api::CoinReadApi;
+use sui_json_rpc::threshold_bls_api::ThresholdBlsApiImpl;
 use sui_types::base_types::{EpochId, TransactionDigest};
 use sui_types::error::{SuiError, SuiResult};
 
@@ -789,6 +790,7 @@ pub async fn build_server(
     server.register_module(CoinReadApi::new(state.clone()))?;
     server.register_module(FullNodeApi::new(state.clone()))?;
     server.register_module(BcsApiImpl::new(state.clone()))?;
+    server.register_module(ThresholdBlsApiImpl::new(state.clone()))?;
     server.register_module(FullNodeTransactionBuilderApi::new(state.clone()))?;
     server.register_module(GovernanceReadApi::new(state.clone()))?;
 
