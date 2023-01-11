@@ -124,13 +124,13 @@ impl<A> QuorumDriver<A> {
     ) -> SuiResult<()> {
         if old_retry_times >= self.max_retry_times {
             // max out the retry times, notify failure
-            self.metrics.total_err_responses.inc();
             info!(tx_digest=?transaction.digest(), "Failed to reach finality after attempting for {} times", old_retry_times+1);
             self.notify(
                 transaction.digest(),
                 &Err(QuorumDriverError::FailedAfterMaximumAttempts {
                     total_attempts: old_retry_times + 1,
                 }),
+                old_retry_times + 1,
             );
             return Ok(());
         }
@@ -155,8 +155,26 @@ impl<A> QuorumDriver<A> {
         .await
     }
 
-    pub fn notify(&self, tx_digest: &TransactionDigest, response: &QuorumDriverResult) {
-        // TODO: add metrics for error type
+    pub fn notify(
+        &self,
+        tx_digest: &TransactionDigest,
+        response: &QuorumDriverResult,
+        total_attempts: u8,
+    ) {
+        match &response {
+            Ok(_) => {
+                self.metrics.total_ok_responses.inc();
+                self.metrics
+                    .attempt_times_ok_response
+                    .report(total_attempts as u64);
+            }
+            Err(err) => {
+                self.metrics
+                    .total_err_responses_by_err
+                    .with_label_values(&[err.as_ref()])
+                    .inc();
+            }
+        }
         self.notifier.notify(tx_digest, response);
     }
 }
@@ -619,7 +637,6 @@ where
     async fn process_task(
         quorum_driver: Arc<QuorumDriver<A>>,
         task: QuorumDriverTask,
-        metrics: Arc<QuorumDriverMetrics>,
     ) {
         debug!(?task, "Quorum Driver processing task");
         let QuorumDriverTask {
@@ -643,8 +660,7 @@ where
                         "forming tx cert",
                     ) {
                         // If non-retryable failure, this task reaches terminal state for now, notify waiter.
-                        metrics.total_err_responses.inc();
-                        quorum_driver.notify(&tx_digest, &Err(qd_error));
+                        quorum_driver.notify(&tx_digest, &Err(qd_error), old_retry_times + 1);
                         return;
                     } else {
                         // re-enqueue if retryable
@@ -684,8 +700,7 @@ where
             }
         };
 
-        metrics.total_ok_responses.inc();
-        quorum_driver.notify(&tx_digest, &Ok(response));
+        quorum_driver.notify(&tx_digest, &Ok(response), old_retry_times + 1);
     }
 
     async fn task_queue_processor(
@@ -707,8 +722,7 @@ where
             }
             metrics.current_requests_in_flight.dec();
             let qd = quorum_driver.clone();
-            let metrics_clone = metrics.clone();
-            spawn_monitored_task!(QuorumDriverHandler::process_task(qd, task, metrics_clone));
+            spawn_monitored_task!(QuorumDriverHandler::process_task(qd, task));
         }
     }
 }
