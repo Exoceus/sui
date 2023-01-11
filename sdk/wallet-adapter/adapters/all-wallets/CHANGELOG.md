@@ -1,5 +1,12 @@
 # @mysten/wallet-adapter-all-wallets
 
+## 0.3.9
+
+### Patch Changes
+
+- @mysten/wallet-adapter-unsafe-burner@0.3.5
+- @mysten/wallet-adapter-wallet-standard@0.3.9
+
 ## 0.3.8
 
 ### Patch Changes

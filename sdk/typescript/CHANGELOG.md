@@ -1,5 +1,11 @@
 # @mysten/sui.js
 
+## 0.23.0
+
+### Minor Changes
+
+- 5cd51dd38: Deprecate sui_executeTransaction in favor of sui_executeTransactionSerializedSig
+
 ## 0.22.0
 
 ### Minor Changes
