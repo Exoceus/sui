@@ -49,6 +49,7 @@ use sui_storage::{
 use sui_types::committee::Committee;
 use sui_types::crypto::KeypairTraits;
 use sui_types::messages::QuorumDriverResponse;
+use tokio::sync::broadcast;
 use tokio::sync::mpsc::channel;
 use tokio::sync::{watch, Mutex};
 use tokio::task::JoinHandle;
@@ -101,9 +102,8 @@ pub struct SuiNode {
     _discovery: discovery::Handle,
     state_sync: state_sync::Handle,
     checkpoint_store: Arc<CheckpointStore>,
-    checkpoint_executor_handle: checkpoint_executor::Handle,
 
-    reconfig_channel: Mutex<tokio::sync::broadcast::Receiver<Committee>>,
+    end_of_epoch_channel: tokio::sync::broadcast::Sender<Committee>,
 
     #[cfg(msim)]
     sim_node: sui_simulator::runtime::NodeHandle,
@@ -200,21 +200,14 @@ impl SuiNode {
         )
         .await;
 
-        let (checkpoint_executor_handle, reconfig_channel) = CheckpointExecutor::new(
-            state_sync_handle.subscribe_to_synced_checkpoints(),
-            checkpoint_store.clone(),
-            state.clone(),
-            config.checkpoint_executor_config.clone(),
-            &prometheus_registry,
-        )
-        .start()?;
+        let (end_of_epoch_channel, _receiver) =
+            broadcast::channel::<Committee>(config.end_of_epoch_broadcast_channel_capacity);
 
         let transaction_orchestrator = if is_full_node {
             Some(Arc::new(
                 TransactiondOrchestrator::new_with_network_clients(
                     state.clone(),
-                    // TODO: use an indirection layer for subscription but not checkpoint executor
-                    checkpoint_executor_handle.subscribe_to_end_of_epoch(),
+                    end_of_epoch_channel.subscribe(),
                     config.db_path(),
                     &prometheus_registry,
                 )?,
@@ -258,8 +251,7 @@ impl SuiNode {
             _discovery: discovery_handle,
             state_sync: state_sync_handle,
             checkpoint_store,
-            checkpoint_executor_handle,
-            reconfig_channel: Mutex::new(reconfig_channel),
+            end_of_epoch_channel,
 
             #[cfg(msim)]
             sim_node: sui_simulator::runtime::NodeHandle::current(),
@@ -274,7 +266,7 @@ impl SuiNode {
     }
 
     pub async fn subscribe_to_epoch_change(&self) -> tokio::sync::broadcast::Receiver<Committee> {
-        self.checkpoint_executor_handle.subscribe_to_end_of_epoch()
+        self.end_of_epoch_channel.subscribe()
     }
 
     pub fn current_epoch(&self) -> EpochId {
@@ -642,12 +634,31 @@ impl SuiNode {
     /// epoch has changed. Upon receiving such signal, we reconfigure the entire system.
     pub async fn monitor_reconfiguration(self: Arc<Self>) -> Result<()> {
         loop {
+            let checkpoint_executor = CheckpointExecutor::new(
+                self.state_sync.subscribe_to_synced_checkpoints(),
+                self.checkpoint_store.clone(),
+                self.state.clone(),
+                self.config.checkpoint_executor_config.clone(),
+                &self.registry_service.default_registry(),
+            )?;
+
+            let executor_handle =
+                spawn_monitored_task!(async move { checkpoint_executor.run().await });
+            executor_handle
+                .await
+                .expect("Failed to join on checkpoint executor run task");
+
             let Committee {
                 epoch: next_epoch, ..
-            } = self.checkpoint_executor.run().await;
+            } = self
+                .state
+                .get_sui_system_state_object()
+                .expect("Failed to read system state object")
+                .get_next_epoch_committee();
+
             info!(
                 ?next_epoch,
-                "Received reconfiguration signal. About to reconfigure the system."
+                "Finished executing all checkpoints in epoch. About to reconfigure the system."
             );
 
             // The following code handles 4 different cases, depending on whether the node

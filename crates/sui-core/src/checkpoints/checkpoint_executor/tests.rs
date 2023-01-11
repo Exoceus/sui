@@ -23,95 +23,64 @@ pub async fn test_checkpoint_executor_crash_recovery() {
     let tempdir = tempdir().unwrap();
     let checkpoint_store = CheckpointStore::new(tempdir.path());
 
-    // new Node (syncing from checkpoint 0)
-    let cold_start_checkpoints = {
-        let (_state, executor, checkpoint_sender, committee): (
-            Arc<AuthorityState>,
-            CheckpointExecutor,
-            Sender<VerifiedCheckpoint>,
-            CommitteeFixture,
-        ) = init_executor_test(buffer_size, checkpoint_store.clone()).await;
+    let (state, executor, checkpoint_sender, committee): (
+        Arc<AuthorityState>,
+        CheckpointExecutor,
+        Sender<VerifiedCheckpoint>,
+        CommitteeFixture,
+    ) = init_executor_test(buffer_size, checkpoint_store.clone()).await;
 
-        assert!(matches!(
-            checkpoint_store
-                .get_highest_executed_checkpoint_seq_number()
-                .unwrap(),
-            None,
-        ));
-        let checkpoints = sync_new_checkpoints(
-            &checkpoint_store,
-            &checkpoint_sender,
-            2 * buffer_size,
-            None,
-            &committee,
-        );
-        let (executor_handle, _reconfig_channel) = executor.start().unwrap();
-        tokio::time::sleep(Duration::from_secs(5)).await;
+    assert!(matches!(
+        checkpoint_store
+            .get_highest_executed_checkpoint_seq_number()
+            .unwrap(),
+        None,
+    ));
+    let checkpoints = sync_new_checkpoints(
+        &checkpoint_store,
+        &checkpoint_sender,
+        2 * buffer_size,
+        None,
+        &committee,
+    );
+    let executor_handle = spawn_monitored_task!(async move { executor.run().await });
+    tokio::time::sleep(Duration::from_secs(5)).await;
 
-        // dropping the channel will cause the checkpoint executor process to exit (gracefully)
-        drop(checkpoint_sender);
-        timeout(Duration::from_secs(1), async {
-            executor_handle
-                .join()
-                .await
-                .expect("Should exit gracefully");
-        })
-        .await
-        .unwrap();
+    // ensure we executed all synced checkpoints
+    assert!(matches!(
+        checkpoint_store.get_highest_executed_checkpoint_seq_number().unwrap(),
+        Some(highest) if highest == 2 * (buffer_size as u64) - 1,
+    ));
 
-        assert!(matches!(
-            checkpoint_store.get_highest_executed_checkpoint_seq_number().unwrap(),
-            Some(highest) if highest == 2 * (buffer_size as u64) - 1,
-        ));
+    // Simulate node restart
+    executor_handle.abort();
 
-        checkpoints
-    };
+    // sync more checkpoints in the meantime
+    let _ = sync_new_checkpoints(
+        &checkpoint_store,
+        &checkpoint_sender,
+        2 * buffer_size,
+        Some(checkpoints.last().cloned().unwrap()),
+        &committee,
+    );
 
-    // Node shutdown, syncing from checkpoint > 0
-    {
-        let last_executed_checkpoint = cold_start_checkpoints.last().cloned().unwrap();
+    // restart checkpoint executor and ensure that it picks
+    // up where it left off
+    let executor = CheckpointExecutor::new_for_tests(
+        checkpoint_sender.subscribe(),
+        checkpoint_store.clone(),
+        state.clone(),
+    )
+    .unwrap();
+    let executor_handle = spawn_monitored_task!(async move { executor.run().await });
+    tokio::time::sleep(Duration::from_secs(5)).await;
 
-        let (_state, executor, checkpoint_sender, committee): (
-            Arc<AuthorityState>,
-            CheckpointExecutor,
-            Sender<VerifiedCheckpoint>,
-            CommitteeFixture,
-        ) = init_executor_test(buffer_size, checkpoint_store.clone()).await;
+    assert!(matches!(
+        checkpoint_store.get_highest_executed_checkpoint_seq_number().unwrap(),
+        Some(highest) if highest == 4 * (buffer_size as u64) - 1,
+    ));
 
-        assert!(matches!(
-            checkpoint_store
-                .get_highest_executed_checkpoint_seq_number()
-                .unwrap(),
-            Some(seq_num) if seq_num == last_executed_checkpoint.sequence_number(),
-        ));
-        // Start syncing new checkpoints from the last checkpoint before
-        // previous shutdown
-        let _ = sync_new_checkpoints(
-            &checkpoint_store,
-            &checkpoint_sender,
-            2 * buffer_size,
-            Some(last_executed_checkpoint),
-            &committee,
-        );
-        let (executor_handle, _reconfig_channel) = executor.start().unwrap();
-        tokio::time::sleep(Duration::from_secs(5)).await;
-
-        // dropping the channel will cause the checkpoint executor process to exit (gracefully)
-        drop(checkpoint_sender);
-        timeout(Duration::from_secs(1), async {
-            executor_handle
-                .join()
-                .await
-                .expect("Should exit gracefully");
-        })
-        .await
-        .unwrap();
-
-        assert!(matches!(
-            checkpoint_store.get_highest_executed_checkpoint_seq_number().unwrap(),
-            Some(highest) if highest == 4 * (buffer_size as u64) - 1,
-        ));
-    }
+    executor_handle.abort();
 }
 
 /// Test that checkpoint execution correctly signals end of epoch after
@@ -165,8 +134,14 @@ pub async fn test_checkpoint_executor_cross_epoch() {
         &second_committee,
     );
 
-    let (_handle, mut reconfig_channel) = executor.start().unwrap();
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    let executor_handle = spawn_monitored_task!(async move { executor.run().await });
+
+    // Ensure executor reaches end of epoch in a timely manner and exits gracefully
+    timeout(Duration::from_secs(5), async {
+        executor_handle.await.expect("Should exit gracefully");
+    })
+    .await
+    .unwrap();
 
     // We should have synced up to epoch boundary
     assert!(matches!(
@@ -174,14 +149,18 @@ pub async fn test_checkpoint_executor_cross_epoch() {
         Some(highest) if highest == (num_to_sync_per_epoch as u64),
     ));
 
-    // Ensure we have end of epoch notification
-    let next_committee = reconfig_channel.recv().await.unwrap();
-    assert_eq!(second_committee.committee(), &next_committee);
-
     authority_state
         .reconfigure(second_committee.committee().clone())
         .await
         .unwrap();
+
+    let executor = CheckpointExecutor::new_for_tests(
+        checkpoint_sender.subscribe(),
+        checkpoint_store.clone(),
+        authority_state.clone(),
+    )
+    .unwrap();
+    let executor_handle = spawn_monitored_task!(async move { executor.run().await });
 
     // checkpoint execution should resume
     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -189,6 +168,8 @@ pub async fn test_checkpoint_executor_cross_epoch() {
         checkpoint_store.get_highest_executed_checkpoint_seq_number().unwrap(),
         Some(highest) if highest == (2 * num_to_sync_per_epoch as u64),
     ));
+
+    executor_handle.abort();
 }
 
 /// Test that if we crash at end of epoch / during reconfig, we recover on startup
@@ -244,10 +225,14 @@ pub async fn test_reconfig_crash_recovery() {
         &second_committee,
     );
 
-    let (executor_handle, mut reconfig_channel) = executor.start().unwrap();
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    let executor_handle = spawn_monitored_task!(async move { executor.run().await });
+    timeout(Duration::from_secs(1), async {
+        executor_handle.await.expect("Should exit gracefully");
+    })
+    .await
+    .unwrap();
 
-    // Check that we paused execution at epoch boundary
+    // Check that we stopped execution at epoch boundary
     assert_eq!(
         checkpoint_store
             .get_highest_executed_checkpoint_seq_number()
@@ -256,56 +241,30 @@ pub async fn test_reconfig_crash_recovery() {
         end_of_epoch_checkpoint.sequence_number(),
     );
 
-    // Check that we have end of epoch notification - this will trigger reconfig
-    let next_committee = reconfig_channel.recv().await.unwrap();
-    assert_eq!(second_committee.committee(), &next_committee);
-
-    // Simulate reconfig crash by dropping the channel and aborting the executor task,
-    // causing checkpoint executor to exit ungracefully.
-    // TODO drop won't work here because we are paused for reconfig and thus are no longer
-    // polling the recv channel. Instead abort() the task
-    drop(checkpoint_sender);
-    executor_handle.event_loop_handle().abort();
-
-    tokio::time::sleep(Duration::from_secs(1)).await;
-
-    // Node restart
-    let (checkpoint_sender, _): (Sender<VerifiedCheckpoint>, Receiver<VerifiedCheckpoint>) =
-        broadcast::channel(10);
+    // Restart checkpoint executor without performing reconfig. This is logically
+    // equivalent to reconfig crashing and the node restarting, in which case executor
+    // should be able to infer that, rather than beginning execution of the next epoch,
+    // we should immediately exit so that reconfig can be reattempted.
     let executor = CheckpointExecutor::new_for_tests(
         checkpoint_sender.subscribe(),
         checkpoint_store.clone(),
         authority_state.clone(),
-    );
-    let (_handle, mut reconfig_channel) = executor.start().unwrap();
+    )
+    .unwrap();
+    let executor_handle = spawn_monitored_task!(async move { executor.run().await });
+    timeout(Duration::from_millis(200), async {
+        executor_handle.await.expect("Should exit immediately");
+    })
+    .await
+    .unwrap();
 
-    // Check that post-startup, we remain paused for reconfig
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // Check that we have still not gone beyond epoch boundary
     assert_eq!(
         checkpoint_store
             .get_highest_executed_checkpoint_seq_number()
             .unwrap()
             .unwrap(),
         end_of_epoch_checkpoint.sequence_number(),
-    );
-
-    // Check that end of epoch is re-signaled so that we re-attempt reconfig
-    let next_committee = reconfig_channel.recv().await.unwrap();
-    assert_eq!(second_committee.committee(), &next_committee);
-
-    authority_state
-        .reconfigure(second_committee.committee().clone())
-        .await
-        .unwrap();
-
-    // checkpoint execution should resume
-    tokio::time::sleep(Duration::from_secs(5)).await;
-    assert_eq!(
-        checkpoint_store
-            .get_highest_executed_checkpoint_seq_number()
-            .unwrap()
-            .unwrap(),
-        end_of_epoch_checkpoint.sequence_number() + 1,
     );
 }
 
@@ -333,7 +292,8 @@ async fn init_executor_test(
         checkpoint_sender.subscribe(),
         store.clone(),
         state.clone(),
-    );
+    )
+    .unwrap();
     let committee = CommitteeFixture::generate(rand::rngs::OsRng, 0, 4);
     (state, executor, checkpoint_sender, committee)
 }

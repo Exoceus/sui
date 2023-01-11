@@ -1,7 +1,10 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::node::{default_checkpoints_per_epoch, AuthorityKeyPairWithPath, KeyPairWithPath};
+use crate::node::{
+    default_checkpoints_per_epoch, default_end_of_epoch_broadcast_channel_capacity,
+    AuthorityKeyPairWithPath, KeyPairWithPath,
+};
 use crate::{
     genesis,
     genesis_config::{GenesisConfig, ValidatorConfigInfo, ValidatorGenesisInfo},
@@ -44,6 +47,7 @@ pub struct ConfigBuilder<R = OsRng> {
     with_swarm: bool,
     validator_ip_sel: ValidatorIpSelection,
     checkpoints_per_epoch: Option<u64>,
+    end_of_epoch_broadcast_channel_capacity: usize,
 }
 
 impl ConfigBuilder {
@@ -64,6 +68,8 @@ impl ConfigBuilder {
                 ValidatorIpSelection::Localhost
             },
             checkpoints_per_epoch: default_checkpoints_per_epoch(),
+            end_of_epoch_broadcast_channel_capacity:
+                default_end_of_epoch_broadcast_channel_capacity(),
         }
     }
 }
@@ -120,6 +126,7 @@ impl<R> ConfigBuilder<R> {
             with_swarm: self.with_swarm,
             validator_ip_sel: self.validator_ip_sel,
             checkpoints_per_epoch: self.checkpoints_per_epoch,
+            end_of_epoch_broadcast_channel_capacity: self.end_of_epoch_broadcast_channel_capacity,
         }
     }
 }
@@ -348,6 +355,8 @@ impl<R: rand::RngCore + rand::CryptoRng> ConfigBuilder<R> {
                     grpc_concurrency_limit: initial_accounts_config.grpc_concurrency_limit,
                     p2p_config,
                     authority_store_pruning_config: AuthorityStorePruningConfig::validator_config(),
+                    end_of_epoch_broadcast_channel_capacity: self
+                        .end_of_epoch_broadcast_channel_capacity,
                     checkpoint_executor_config: Default::default(),
                 }
             })

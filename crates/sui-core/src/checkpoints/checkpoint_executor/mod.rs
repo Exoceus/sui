@@ -1,8 +1,9 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! CheckpointExecutor spawns an active process that acts as a Consumer to
-//! StateSync for newly synced checkpoints, taking these checkpoints and
+//! CheckpointExecutor is a Node component that executes all checkpoints for the
+//! given epoch. It acts as a Consumer to StateSync
+//! for newly synced checkpoints, taking these checkpoints and
 //! scheduling and monitoring their execution. Its primary goal is to allow
 //! for catching up to the current checkpoint sequence number of the network
 //! as quickly as possible so that a newly joined, or recovering Node can
@@ -13,11 +14,11 @@
 //! CheckpointExecutor is made recoverable in the event of Node shutdown by way of a watermark,
 //! highest_executed_checkpoint, which is guaranteed to be updated sequentially in order,
 //! despite checkpoints themselves potentially being executed nonsequentially and in parallel.
-//! CheckpointExecutor parallelizes checkpoints of the same epoch as much as possible, and
-//! handles epoch boundaries by calling to reconfig once all checkpoints of an epoch have finished
-//! executing.
+//! CheckpointExecutor parallelizes checkpoints of the same epoch as much as possible.
+//! CheckpointExecutor enforces the invariant that if `run` returns successfully, we have reached the
+//! end of epoch. This allows us to use it as a signal for reconfig.
 
-use std::{cmp::Ordering, collections::HashMap, sync::Arc, thread::JoinHandle, time::Duration};
+use std::{cmp::Ordering, collections::HashMap, sync::Arc, time::Duration};
 
 use futures::stream::FuturesOrdered;
 use mysten_metrics::spawn_monitored_task;
@@ -33,6 +34,7 @@ use sui_types::{
 };
 use tokio::{
     sync::broadcast::{self, error::RecvError},
+    task::JoinHandle,
     time::timeout,
 };
 use tokio_stream::StreamExt;
@@ -85,12 +87,12 @@ pub struct CheckpointExecutor {
 }
 
 impl CheckpointExecutor {
-    fn new(
+    pub fn new(
         mailbox: broadcast::Receiver<VerifiedCheckpoint>,
         checkpoint_store: Arc<CheckpointStore>,
         authority_state: Arc<AuthorityState>,
         config: CheckpointExecutorConfig,
-        metrics: Arc<CheckpointExecutorMetrics>,
+        prometheus_registry: &Registry,
     ) -> Result<Self, TypedStoreError> {
         Ok(Self {
             mailbox,
@@ -100,28 +102,31 @@ impl CheckpointExecutor {
             highest_scheduled_seq_num: None,
             latest_synced_checkpoint: None,
             end_of_epoch: false,
-            metrics,
+            metrics: CheckpointExecutorMetrics::new(prometheus_registry),
         })
     }
 
-    fn new_for_tests(
+    pub fn new_for_tests(
         mailbox: broadcast::Receiver<VerifiedCheckpoint>,
         checkpoint_store: Arc<CheckpointStore>,
         authority_state: Arc<AuthorityState>,
     ) -> Result<Self, TypedStoreError> {
-        Self::new(
+        Ok(Self {
             mailbox,
             checkpoint_store,
             authority_state,
-            Default::default(),
-            CheckpointExecutorMetrics::new_for_tests(),
-        )
+            config: Default::default(),
+            highest_scheduled_seq_num: None,
+            latest_synced_checkpoint: None,
+            end_of_epoch: false,
+            metrics: CheckpointExecutorMetrics::new_for_tests(),
+        })
     }
 
     pub async fn run(mut self) -> Committee {
         match self.handle_crash_recovery().await.unwrap() {
             Some(committee) => committee,
-            None => self.execute_checkpoints_for_epoch().await.unwrap(),
+            None => self.execute_checkpoints_for_epoch().await,
         }
     }
 
@@ -160,7 +165,7 @@ impl CheckpointExecutor {
     }
 
     /// Executes all checkpoints for the current epoch and returns the next committee
-    pub async fn execute_checkpoints_for_epoch(&mut self) -> Option<Committee> {
+    pub async fn execute_checkpoints_for_epoch(&mut self) -> Committee {
         let mut pending: CheckpointExecutionBuffer = FuturesOrdered::new();
 
         loop {
@@ -216,7 +221,7 @@ impl CheckpointExecutor {
                                 "Pending checkpoint execution buffer should be empty after processing last checkpoint of epoch",
                             );
                             drop(pending);
-                            return Some(self.create_committee_object(checkpoint, committee));
+                            return self.create_committee_object(checkpoint, committee);
                         }
                     }
                 }
@@ -245,8 +250,7 @@ impl CheckpointExecutor {
                             .inc_by(num_skipped);
                     }
                     Err(RecvError::Closed) => {
-                        info!("Checkpoint Execution Sender (StateSync) closed channel");
-                        return None;
+                        panic!("Checkpoint Execution Sender (StateSync) closed channel unexpectedly");
                     }
                 },
             }

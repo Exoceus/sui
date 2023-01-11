@@ -84,6 +84,12 @@ pub struct NodeConfig {
     #[serde(default = "default_authority_store_pruning_config")]
     pub authority_store_pruning_config: AuthorityStorePruningConfig,
 
+    /// Size of the broadcast channel used for notifying other systems of end of epoch.
+    ///
+    /// If unspecified, this will default to `128`.
+    #[serde(default = "default_end_of_epoch_broadcast_channel_capacity")]
+    pub end_of_epoch_broadcast_channel_capacity: usize,
+
     #[serde(default)]
     pub checkpoint_executor_config: CheckpointExecutorConfig,
 }
@@ -133,6 +139,10 @@ pub fn default_concurrency_limit() -> Option<usize> {
 
 pub fn default_checkpoints_per_epoch() -> Option<u64> {
     None
+}
+
+pub fn default_end_of_epoch_broadcast_channel_capacity() -> usize {
+    128
 }
 
 pub fn bool_true() -> bool {
@@ -229,12 +239,6 @@ pub struct CheckpointExecutorConfig {
     #[serde(default = "default_checkpoint_execution_max_concurrency")]
     pub checkpoint_execution_max_concurrency: usize,
 
-    /// Size of the broadcast channel use for notifying other systems of end of epoch.
-    ///
-    /// If unspecified, this will default to `128`.
-    #[serde(default = "default_end_of_epoch_broadcast_channel_capacity")]
-    pub end_of_epoch_broadcast_channel_capacity: usize,
-
     /// Number of seconds to wait for effects of a batch of transactions
     /// before logging a warning. Note that we will continue to retry
     /// indefinitely
@@ -248,10 +252,6 @@ fn default_checkpoint_execution_max_concurrency() -> usize {
     100
 }
 
-fn default_end_of_epoch_broadcast_channel_capacity() -> usize {
-    128
-}
-
 fn default_local_execution_timeout_sec() -> u64 {
     10
 }
@@ -260,8 +260,6 @@ impl Default for CheckpointExecutorConfig {
     fn default() -> Self {
         Self {
             checkpoint_execution_max_concurrency: default_checkpoint_execution_max_concurrency(),
-            end_of_epoch_broadcast_channel_capacity:
-                default_end_of_epoch_broadcast_channel_capacity(),
             local_execution_timeout_sec: default_local_execution_timeout_sec(),
         }
     }
